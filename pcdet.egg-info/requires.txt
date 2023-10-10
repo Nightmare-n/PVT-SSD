@@ -1,0 +1,12 @@
+numpy
+llvmlite
+numba
+tensorboardX
+easydict
+pyyaml
+tqdm
+SharedArray
+pycocotools
+terminaltables
+einops
+timm
