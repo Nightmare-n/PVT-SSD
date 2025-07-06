@@ -2,7 +2,7 @@ import os
 
 import torch
 import torch.nn as nn
-
+import numpy as np
 from ...ops.iou3d_nms import iou3d_nms_utils
 from ...utils.spconv_utils import find_all_spconv_keys
 from .. import backbones_2d, backbones_3d, dense_heads
@@ -395,7 +395,9 @@ class Detector3DTemplate(nn.Module):
 
         logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
         loc_type = torch.device('cpu') if to_cpu else None
-        checkpoint = torch.load(filename, map_location=loc_type)
+        # torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+        torch.serialization.add_safe_globals([np.dtype])
+        checkpoint = torch.load(filename, map_location=loc_type,weights_only=False)
         model_state_disk = checkpoint['model_state']
 
         version = checkpoint.get("version", None)
@@ -416,7 +418,7 @@ class Detector3DTemplate(nn.Module):
 
         logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
         loc_type = torch.device('cpu') if to_cpu else None
-        checkpoint = torch.load(filename, map_location=loc_type)
+        checkpoint = torch.load(filename, map_location=loc_type,weights_only=False)
         epoch = checkpoint.get('epoch', -1)
         it = checkpoint.get('it', 0.0)
 

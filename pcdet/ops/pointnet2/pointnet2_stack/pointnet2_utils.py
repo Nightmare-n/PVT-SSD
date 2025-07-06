@@ -261,10 +261,13 @@ class ThreeInterpolate(Function):
 
 three_interpolate = ThreeInterpolate.apply
 
+from torch.amp import custom_fwd, custom_bwd
+from torch.autograd import Function
 
 class KInterpolate(Function):
 
     @staticmethod
+    # @custom_fwd(cast_inputs=torch.float32,device_type='cuda')
     def forward(ctx, features: torch.Tensor, idx: torch.Tensor, weight: torch.Tensor):
         """
         Args:
@@ -284,6 +287,7 @@ class KInterpolate(Function):
         return output
 
     @staticmethod
+    # @custom_bwd(cast_inputs=torch.float32)
     def backward(ctx, grad_out: torch.Tensor):
         """
         Args:

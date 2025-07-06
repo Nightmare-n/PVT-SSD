@@ -18,9 +18,9 @@ class DatasetTemplate(torch_data.Dataset):
         self.class_names = class_names
         self.logger = logger
         self.root_path = root_path if root_path is not None else Path(self.dataset_cfg.DATA_PATH)
-        self.client = getattr(file_client, self.dataset_cfg.BACKEND.NAME)(
-            **self.dataset_cfg.BACKEND.get('KWARGS', {})
-        )
+        # self.client = getattr(file_client, self.dataset_cfg.BACKEND.NAME)(
+        #     **self.dataset_cfg.BACKEND.get('KWARGS', {})
+        # )
         if self.dataset_cfg is None or class_names is None:
             return
         

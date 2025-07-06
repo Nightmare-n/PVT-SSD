@@ -76,7 +76,6 @@ class ResidualCoder(object):
 
         cgs = [t + a for t, a in zip(cts, cas)]
         return torch.cat([xg, yg, zg, dxg, dyg, dzg, rg, *cgs], dim=-1)
-    
 
 class PointResidualCoder(object):
     def __init__(self, code_size=8, use_mean_size=True, **kwargs):

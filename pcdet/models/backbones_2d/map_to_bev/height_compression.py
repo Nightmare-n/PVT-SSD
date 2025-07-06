@@ -24,6 +24,26 @@ class HeightCompression(nn.Module):
 
         """
         encoded_spconv_tensor = batch_dict['encoded_spconv_tensor']
+        from spconv.pytorch import SparseConvTensor
+        
+        old: SparseConvTensor = encoded_spconv_tensor
+
+        # 1) compute sort order
+        sorted_idx = torch.argsort(old.indices[:, 0])
+
+        # 2) slice out your sorted pieces
+        new_indices  = old.indices[sorted_idx]
+        new_features = old.features[sorted_idx]
+
+        # 3) re-build a brand-new tensor
+        new = SparseConvTensor(
+            new_features,
+            new_indices,
+            old.spatial_shape,   # same spatial dims
+            old.batch_size       # same batch size
+        )
+        batch_dict['encoded_spconv_tensor'] = new
+        encoded_spconv_tensor = new
         spatial_features = encoded_spconv_tensor.dense()
         N, H, W = spatial_features.shape[0], spatial_features.shape[-2], spatial_features.shape[-1]
 

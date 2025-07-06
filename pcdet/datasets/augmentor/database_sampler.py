@@ -7,8 +7,8 @@ import SharedArray
 import torch.distributed as dist
 
 from ...ops.iou3d_nms import iou3d_nms_utils
-from ...utils import box_utils, common_utils, file_client
-
+from ...utils import box_utils, common_utils, calibration_kitti 
+from pcdet.datasets.kitti.kitti_object_eval_python import kitti_common
 
 class DataBaseSampler(object):
     def __init__(self, root_path, sampler_cfg, class_names, logger=None):
@@ -22,16 +22,26 @@ class DataBaseSampler(object):
             
         self.use_shared_memory = sampler_cfg.get('USE_SHARED_MEMORY', False)
         
-        self.client = getattr(file_client, self.sampler_cfg.BACKEND.NAME)(
-            **self.sampler_cfg.BACKEND.KWARGS
-        )
-        
+        # self.client = getattr(file_client, self.sampler_cfg.BACKEND.NAME)(
+        #     **self.sampler_cfg.BACKEND.KWARGS
+        # )
+        self.img_aug_type = sampler_cfg.get('IMG_AUG_TYPE', None)
+
         self.fade_epoch = sampler_cfg.get('FADE_EPOCH', 0)
 
         for db_info_path in sampler_cfg.DB_INFO_PATH:
             db_info_path = self.root_path.resolve() / db_info_path
-            infos = self.client.load_pickle(db_info_path)
-            [self.db_infos[cur_class].extend(infos[cur_class]) for cur_class in class_names]
+
+            if not db_info_path.exists():
+                assert len(sampler_cfg.DB_INFO_PATH) == 1
+                sampler_cfg.DB_INFO_PATH[0] = sampler_cfg.BACKUP_DB_INFO['DB_INFO_PATH']
+                sampler_cfg.DB_DATA_PATH[0] = sampler_cfg.BACKUP_DB_INFO['DB_DATA_PATH']
+                db_info_path = self.root_path.resolve() / sampler_cfg.DB_INFO_PATH[0]
+                sampler_cfg.NUM_POINT_FEATURES = sampler_cfg.BACKUP_DB_INFO['NUM_POINT_FEATURES']
+
+            with open(str(db_info_path), 'rb') as f:
+                infos = pickle.load(f)
+                [self.db_infos[cur_class].extend(infos[cur_class]) for cur_class in class_names]
 
         for func_name, val in sampler_cfg.PREPARE.items():
             self.db_infos = getattr(self, func_name)(self.db_infos, val)
@@ -157,8 +167,205 @@ class DataBaseSampler(object):
         mv_height = gt_boxes[:, 2] - gt_boxes[:, 5] / 2 - cur_lidar_height
         gt_boxes[:, 2] -= mv_height  # lidar view
         return gt_boxes, mv_height
+    
+    def copy_paste_to_image_kitti(self, data_dict, crop_feat, gt_number, point_idxes=None):
+        kitti_img_aug_type = 'by_depth'
+        kitti_img_aug_use_type = 'annotation'
 
-    def add_sampled_boxes_to_scene(self, data_dict, sampled_gt_boxes, total_valid_sampled_dict):
+        image = data_dict['images']
+        boxes3d = data_dict['gt_boxes']
+        boxes2d = data_dict['gt_boxes2d']
+        corners_lidar = box_utils.boxes_to_corners_3d(boxes3d)
+        if 'depth' in kitti_img_aug_type:
+            paste_order = boxes3d[:,0].argsort()
+            paste_order = paste_order[::-1]
+        else:
+            paste_order = np.arange(len(boxes3d),dtype=np.int)
+
+        if 'reverse' in kitti_img_aug_type:
+            paste_order = paste_order[::-1]
+
+        paste_mask = -255 * np.ones(image.shape[:2], dtype=np.int)
+        fg_mask = np.zeros(image.shape[:2], dtype=np.int)
+        overlap_mask = np.zeros(image.shape[:2], dtype=np.int)
+        depth_mask = np.zeros((*image.shape[:2], 2), dtype=np.float)
+        points_2d, depth_2d = data_dict['calib'].lidar_to_img(data_dict['points'][:,:3])
+        points_2d[:,0] = np.clip(points_2d[:,0], a_min=0, a_max=image.shape[1]-1)
+        points_2d[:,1] = np.clip(points_2d[:,1], a_min=0, a_max=image.shape[0]-1)
+        points_2d = points_2d.astype(np.int)
+        for _order in paste_order:
+            _box2d = boxes2d[_order]
+            image[_box2d[1]:_box2d[3],_box2d[0]:_box2d[2]] = crop_feat[_order]
+            overlap_mask[_box2d[1]:_box2d[3],_box2d[0]:_box2d[2]] += \
+                (paste_mask[_box2d[1]:_box2d[3],_box2d[0]:_box2d[2]] > 0).astype(np.int)
+            paste_mask[_box2d[1]:_box2d[3],_box2d[0]:_box2d[2]] = _order
+
+            if 'cover' in kitti_img_aug_use_type:
+                # HxWx2 for min and max depth of each box region
+                depth_mask[_box2d[1]:_box2d[3],_box2d[0]:_box2d[2],0] = corners_lidar[_order,:,0].min()
+                depth_mask[_box2d[1]:_box2d[3],_box2d[0]:_box2d[2],1] = corners_lidar[_order,:,0].max()
+
+            # foreground area of original point cloud in image plane
+            if _order < gt_number:
+                fg_mask[_box2d[1]:_box2d[3],_box2d[0]:_box2d[2]] = 1
+
+        data_dict['images'] = image
+
+        # if not self.joint_sample:
+        #     return data_dict
+
+        new_mask = paste_mask[points_2d[:,1], points_2d[:,0]]==(point_idxes+gt_number)
+        if False:  # self.keep_raw:
+            raw_mask = (point_idxes == -1)
+        else:
+            raw_fg = (fg_mask == 1) & (paste_mask >= 0) & (paste_mask < gt_number)
+            raw_bg = (fg_mask == 0) & (paste_mask < 0)
+            raw_mask = raw_fg[points_2d[:,1], points_2d[:,0]] | raw_bg[points_2d[:,1], points_2d[:,0]]
+        keep_mask = new_mask | raw_mask
+        data_dict['points_2d'] = points_2d
+
+        if 'annotation' in kitti_img_aug_use_type:
+            data_dict['points'] = data_dict['points'][keep_mask]
+            data_dict['points_2d'] = data_dict['points_2d'][keep_mask]
+        elif 'projection' in kitti_img_aug_use_type:
+            overlap_mask[overlap_mask>=1] = 1
+            data_dict['overlap_mask'] = overlap_mask
+            if 'cover' in kitti_img_aug_use_type:
+                data_dict['depth_mask'] = depth_mask
+
+        return data_dict
+    
+    def collect_image_crops_kitti(self, info, data_dict, obj_points, sampled_gt_boxes, sampled_gt_boxes2d, idx):
+        calib_file = kitti_common.get_calib_path(int(info['image_idx']), self.root_path, relative_path=False)
+        sampled_calib = calibration_kitti.Calibration(calib_file)
+        points_2d, depth_2d = sampled_calib.lidar_to_img(obj_points[:,:3])
+
+        if True:  # self.point_refine:
+            # align calibration metrics for points
+            points_ract = data_dict['calib'].img_to_rect(points_2d[:,0], points_2d[:,1], depth_2d)
+            points_lidar = data_dict['calib'].rect_to_lidar(points_ract)
+            obj_points[:, :3] = points_lidar
+            # align calibration metrics for boxes
+            box3d_raw = sampled_gt_boxes[idx].reshape(1,-1)
+            box3d_coords = box_utils.boxes_to_corners_3d(box3d_raw)[0]
+            box3d_box, box3d_depth = sampled_calib.lidar_to_img(box3d_coords)
+            box3d_coord_rect = data_dict['calib'].img_to_rect(box3d_box[:,0], box3d_box[:,1], box3d_depth)
+            box3d_rect = box_utils.corners_rect_to_camera(box3d_coord_rect).reshape(1,-1)
+            box3d_lidar = box_utils.boxes3d_kitti_camera_to_lidar(box3d_rect, data_dict['calib'])
+            box2d = box_utils.boxes3d_kitti_camera_to_imageboxes(box3d_rect, data_dict['calib'],
+                                                                    data_dict['images'].shape[:2])
+            sampled_gt_boxes[idx] = box3d_lidar[0]
+            sampled_gt_boxes2d[idx] = box2d[0]
+
+        obj_idx = idx * np.ones(len(obj_points), dtype=np.int)
+
+        # copy crops from images
+        img_path = self.root_path /  f'training/image_2/{info["image_idx"]}.png'
+        raw_image = io.imread(img_path)
+        raw_image = raw_image.astype(np.float32)
+        raw_center = info['bbox'].reshape(2,2).mean(0)
+        new_box = sampled_gt_boxes2d[idx].astype(np.int)
+        new_shape = np.array([new_box[2]-new_box[0], new_box[3]-new_box[1]])
+        raw_box = np.concatenate([raw_center-new_shape/2, raw_center+new_shape/2]).astype(np.int)
+        raw_box[0::2] = np.clip(raw_box[0::2], a_min=0, a_max=raw_image.shape[1])
+        raw_box[1::2] = np.clip(raw_box[1::2], a_min=0, a_max=raw_image.shape[0])
+        if (raw_box[2]-raw_box[0])!=new_shape[0] or (raw_box[3]-raw_box[1])!=new_shape[1]:
+            new_center = new_box.reshape(2,2).mean(0)
+            new_shape = np.array([raw_box[2]-raw_box[0], raw_box[3]-raw_box[1]])
+            new_box = np.concatenate([new_center-new_shape/2, new_center+new_shape/2]).astype(np.int)
+
+        img_crop2d = raw_image[raw_box[1]:raw_box[3],raw_box[0]:raw_box[2]] / 255
+
+        return new_box, img_crop2d, obj_points, obj_idx
+
+    def sample_gt_boxes_2d_kitti(self, data_dict, sampled_boxes, valid_mask):
+        mv_height = None
+        # filter out box2d iou > thres
+        if self.sampler_cfg.get('USE_ROAD_PLANE', False):
+            sampled_boxes, mv_height = self.put_boxes_on_road_planes(
+                sampled_boxes, data_dict['road_plane'], data_dict['calib']
+            )
+
+        # sampled_boxes2d = np.stack([x['bbox'] for x in sampled_dict], axis=0).astype(np.float32)
+        boxes3d_camera = box_utils.boxes3d_lidar_to_kitti_camera(sampled_boxes, data_dict['calib'])
+        sampled_boxes2d = box_utils.boxes3d_kitti_camera_to_imageboxes(boxes3d_camera, data_dict['calib'],
+                                                                        data_dict['images'].shape[:2])
+        sampled_boxes2d = torch.Tensor(sampled_boxes2d)
+        existed_boxes2d = torch.Tensor(data_dict['gt_boxes2d'])
+        iou2d1 = box_utils.pairwise_iou(sampled_boxes2d, existed_boxes2d).cpu().numpy()
+        iou2d2 = box_utils.pairwise_iou(sampled_boxes2d, sampled_boxes2d).cpu().numpy()
+        iou2d2[range(sampled_boxes2d.shape[0]), range(sampled_boxes2d.shape[0])] = 0
+        iou2d1 = iou2d1 if iou2d1.shape[1] > 0 else iou2d2
+
+        ret_valid_mask = ((iou2d1.max(axis=1)<self.img_aug_iou_thresh) &
+                         (iou2d2.max(axis=1)<self.img_aug_iou_thresh) &
+                         (valid_mask))
+
+        sampled_boxes2d = sampled_boxes2d[ret_valid_mask].cpu().numpy()
+        if mv_height is not None:
+            mv_height = mv_height[ret_valid_mask]
+        return sampled_boxes2d, mv_height, ret_valid_mask
+
+    def sample_gt_boxes_2d(self, data_dict, sampled_boxes, valid_mask):
+        mv_height = None
+
+        if self.img_aug_type == 'kitti':
+            sampled_boxes2d, mv_height, ret_valid_mask = self.sample_gt_boxes_2d_kitti(data_dict, sampled_boxes, valid_mask)
+        else:
+            raise NotImplementedError
+
+        return sampled_boxes2d, mv_height, ret_valid_mask
+
+    def initilize_image_aug_dict(self, data_dict, gt_boxes_mask):
+        img_aug_gt_dict = None
+        if self.img_aug_type is None:
+            pass
+        elif self.img_aug_type == 'kitti':
+            obj_index_list, crop_boxes2d = [], []
+            gt_number = gt_boxes_mask.sum().astype(np.int)
+            gt_boxes2d = data_dict['gt_boxes2d'][gt_boxes_mask].astype(np.int)
+            gt_crops2d = [data_dict['images'][_x[1]:_x[3],_x[0]:_x[2]] for _x in gt_boxes2d]
+
+            img_aug_gt_dict = {
+                'obj_index_list': obj_index_list,
+                'gt_crops2d': gt_crops2d,
+                'gt_boxes2d': gt_boxes2d,
+                'gt_number': gt_number,
+                'crop_boxes2d': crop_boxes2d
+            }
+        else:
+            raise NotImplementedError
+
+        return img_aug_gt_dict
+
+    def collect_image_crops(self, img_aug_gt_dict, info, data_dict, obj_points, sampled_gt_boxes, sampled_gt_boxes2d, idx):
+        if self.img_aug_type == 'kitti':
+            new_box, img_crop2d, obj_points, obj_idx = self.collect_image_crops_kitti(info, data_dict,
+                                                    obj_points, sampled_gt_boxes, sampled_gt_boxes2d, idx)
+            img_aug_gt_dict['crop_boxes2d'].append(new_box)
+            img_aug_gt_dict['gt_crops2d'].append(img_crop2d)
+            img_aug_gt_dict['obj_index_list'].append(obj_idx)
+        else:
+            raise NotImplementedError
+
+        return img_aug_gt_dict, obj_points
+
+    def copy_paste_to_image(self, img_aug_gt_dict, data_dict, points):
+        if self.img_aug_type == 'kitti':
+            obj_points_idx = np.concatenate(img_aug_gt_dict['obj_index_list'], axis=0)
+            point_idxes = -1 * np.ones(len(points), dtype=np.int)
+            point_idxes[:obj_points_idx.shape[0]] = obj_points_idx
+
+            data_dict['gt_boxes2d'] = np.concatenate([img_aug_gt_dict['gt_boxes2d'], np.array(img_aug_gt_dict['crop_boxes2d'])], axis=0)
+            data_dict = self.copy_paste_to_image_kitti(data_dict, img_aug_gt_dict['gt_crops2d'], img_aug_gt_dict['gt_number'], point_idxes)
+            if 'road_plane' in data_dict:
+                data_dict.pop('road_plane')
+        else:
+            raise NotImplementedError
+        return data_dict
+
+
+    def add_sampled_boxes_to_scene(self, data_dict, sampled_gt_boxes, total_valid_sampled_dict, mv_height=None, sampled_gt_boxes2d=None):
         gt_boxes_mask = data_dict['gt_boxes_mask']
         gt_boxes = data_dict['gt_boxes'][gt_boxes_mask]
         gt_names = data_dict['gt_names'][gt_boxes_mask]
@@ -183,14 +390,21 @@ class DataBaseSampler(object):
                 obj_points = copy.deepcopy(gt_database_data[start_offset:end_offset])
             else:
                 file_path = self.root_path / info['path']
-                obj_points = self.client.load_to_numpy(file_path, dtype=np.float32).reshape(
+                obj_points = np.fromfile(str(file_path), dtype=np.float32).reshape(
                     [-1, self.sampler_cfg.NUM_POINT_FEATURES])
+                if obj_points.shape[0] != info['num_points_in_gt']:
+                    obj_points = np.fromfile(str(file_path), dtype=np.float64).reshape(-1, self.sampler_cfg.NUM_POINT_FEATURES)
 
             obj_points[:, :3] += info['box3d_lidar'][:3]
 
             if self.sampler_cfg.get('USE_ROAD_PLANE', False):
                 # mv height
                 obj_points[:, 2] -= mv_height[idx]
+            
+            if self.img_aug_type is not None:
+                img_aug_gt_dict, obj_points = self.collect_image_crops(
+                    img_aug_gt_dict, info, data_dict, obj_points, sampled_gt_boxes, sampled_gt_boxes2d, idx
+                )
 
             obj_points_list.append(obj_points)
 
@@ -203,6 +417,22 @@ class DataBaseSampler(object):
             )
             points = box_utils.remove_points_in_boxes3d(points, large_sampled_gt_boxes)
 
+        if self.sampler_cfg.get('FILTER_OBJ_POINTS_BY_TIMESTAMP', False) or obj_points.shape[-1] != points.shape[-1]:
+            if self.sampler_cfg.get('FILTER_OBJ_POINTS_BY_TIMESTAMP', False):
+                min_time = min(self.sampler_cfg.TIME_RANGE[0], self.sampler_cfg.TIME_RANGE[1])
+                max_time = max(self.sampler_cfg.TIME_RANGE[0], self.sampler_cfg.TIME_RANGE[1])
+            else:
+                assert obj_points.shape[-1] == points.shape[-1] + 1
+                # transform multi-frame GT points to single-frame GT points
+                min_time = max_time = 0.0
+
+            time_mask = np.logical_and(obj_points[:, -1] < max_time + 1e-6, obj_points[:, -1] > min_time - 1e-6)
+            obj_points = obj_points[time_mask]
+
+        large_sampled_gt_boxes = box_utils.enlarge_box3d(
+            sampled_gt_boxes[:, 0:7], extra_width=self.sampler_cfg.REMOVE_EXTRA_WIDTH
+        )
+        points = box_utils.remove_points_in_boxes3d(points, large_sampled_gt_boxes)
         points = np.concatenate([
             np.concatenate([obj_points, np.zeros((obj_points.shape[0], points.shape[-1] - obj_points.shape[-1]), dtype=obj_points.dtype)], axis=-1), 
             points], axis=0
@@ -230,6 +460,9 @@ class DataBaseSampler(object):
         gt_names = data_dict['gt_names'].astype(str)
         existed_boxes = gt_boxes
         total_valid_sampled_dict = []
+        sampled_mv_height = []
+        sampled_gt_boxes2d = []
+
         for class_name, sample_group in self.sample_groups.items():
             if self.limit_whole_scene:
                 num_gt = np.sum(class_name == gt_names)
@@ -246,16 +479,30 @@ class DataBaseSampler(object):
                 iou2 = iou3d_nms_utils.boxes_bev_iou_cpu(sampled_boxes[:, 0:7], sampled_boxes[:, 0:7])
                 iou2[range(sampled_boxes.shape[0]), range(sampled_boxes.shape[0])] = 0
                 iou1 = iou1 if iou1.shape[1] > 0 else iou2
-                valid_mask = ((iou1.max(axis=1) + iou2.max(axis=1)) == 0).nonzero()[0]
+                valid_mask = ((iou1.max(axis=1) + iou2.max(axis=1)) == 0)
+
+                if self.img_aug_type is not None:
+                    sampled_boxes2d, mv_height, valid_mask = self.sample_gt_boxes_2d(data_dict, sampled_boxes, valid_mask)
+                    sampled_gt_boxes2d.append(sampled_boxes2d)
+                    if mv_height is not None:
+                        sampled_mv_height.append(mv_height)
+
+                valid_mask = valid_mask.nonzero()[0]
+
                 valid_sampled_dict = [sampled_dict[x] for x in valid_mask]
                 valid_sampled_boxes = sampled_boxes[valid_mask]
-
-                existed_boxes = np.concatenate((existed_boxes, valid_sampled_boxes), axis=0)
+                # print(existed_boxes.shape,valid_sampled_boxes.shape)
+                existed_boxes = np.concatenate((existed_boxes, valid_sampled_boxes[:,:existed_boxes.shape[-1]]), axis=0)
                 total_valid_sampled_dict.extend(valid_sampled_dict)
 
         sampled_gt_boxes = existed_boxes[gt_boxes.shape[0]:, :]
         if total_valid_sampled_dict.__len__() > 0:
-            data_dict = self.add_sampled_boxes_to_scene(data_dict, sampled_gt_boxes, total_valid_sampled_dict)
+            sampled_gt_boxes2d = np.concatenate(sampled_gt_boxes2d, axis=0) if len(sampled_gt_boxes2d) > 0 else None
+            sampled_mv_height = np.concatenate(sampled_mv_height, axis=0) if len(sampled_mv_height) > 0 else None
+            # data_dict = self.add_sampled_boxes_to_scene(data_dict, sampled_gt_boxes, total_valid_sampled_dict)
+            data_dict = self.add_sampled_boxes_to_scene(
+                data_dict, sampled_gt_boxes, total_valid_sampled_dict, sampled_mv_height, sampled_gt_boxes2d
+            )
 
         data_dict.pop('gt_boxes_mask')
         return data_dict

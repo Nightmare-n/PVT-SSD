@@ -258,7 +258,7 @@ def get_corner_loss_lidar(pred_bbox3d: torch.Tensor, gt_bbox3d: torch.Tensor, p=
     # (N, 8)
     if p == 2:
         corner_dist = torch.min(torch.norm(pred_box_corners - gt_box_corners, dim=2),
-                                torch.norm(pred_box_corners - gt_box_corners_flip, dim=2))
+        torch.norm(pred_box_corners - gt_box_corners_flip, dim=2))
         # (N, 8)
         corner_loss = WeightedSmoothL1Loss.smooth_l1_loss(corner_dist, beta=1.0)
     else:

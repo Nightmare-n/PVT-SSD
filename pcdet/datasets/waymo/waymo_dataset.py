@@ -1,7 +1,6 @@
 # OpenPCDet PyTorch Dataloader and Evaluation Tools for Waymo Open Dataset
 # Reference https://github.com/open-mmlab/OpenPCDet
 # Written by Shaoshuai Shi, Chaoxu Guo
-# All Rights Reserved 2019-2020.
 
 import os
 import pickle
@@ -13,8 +12,10 @@ import SharedArray
 import torch.distributed as dist
 from tqdm import tqdm
 from pathlib import Path
+from functools import partial
+
 from ...ops.roiaware_pool3d import roiaware_pool3d_utils
-from ...utils import box_utils, common_utils, file_client
+from ...utils import box_utils, common_utils
 from ..dataset import DatasetTemplate
 
 
@@ -27,15 +28,13 @@ class WaymoDataset(DatasetTemplate):
         self.data_path = self.root_path / self.dataset_cfg.PROCESSED_DATA_TAG
         self.split = self.dataset_cfg.DATA_SPLIT[self.mode]
         split_dir = self.root_path / 'ImageSets' / (self.split + '.txt')
-        with self.client.get_local_path(split_dir) as path:
-            self.sample_sequence_list = [x.strip() for x in open(path).readlines()]
+        self.sample_sequence_list = [x.strip() for x in open(split_dir).readlines()]
 
         self.num_sweeps = self.dataset_cfg.NUM_SWEEPS
         self.use_time_lag = self.dataset_cfg.USE_TIME_LAG
-        # self.time_lag_type = self.dataset_cfg.get('TIME_LAG_TYPE', 1)
 
         self.infos = []
-        self.include_waymo_data(self.mode)
+        self.seq_name_to_infos = self.include_waymo_data(self.mode)
 
         self.use_shared_memory = self.dataset_cfg.get('USE_SHARED_MEMORY', False) and self.training
         if self.use_shared_memory:
@@ -57,25 +56,27 @@ class WaymoDataset(DatasetTemplate):
         )
         self.split = split
         split_dir = self.root_path / 'ImageSets' / (self.split + '.txt')
-        with self.client.get_local_path(split_dir) as path:
-            self.sample_sequence_list = [x.strip() for x in open(path).readlines()]
+        self.sample_sequence_list = [x.strip() for x in open(split_dir).readlines()]
         self.infos = []
-        self.include_waymo_data(self.mode)
+        self.seq_name_to_infos = self.include_waymo_data(self.mode)
 
     def include_waymo_data(self, mode):
         self.logger.info('Loading Waymo dataset')
         waymo_infos = []
-
+        seq_name_to_infos = {}
         num_skipped_infos = 0
         for k in range(len(self.sample_sequence_list)):
             sequence_name = os.path.splitext(self.sample_sequence_list[k])[0]
             info_path = self.data_path / sequence_name / ('%s.pkl' % sequence_name)
             info_path = self.check_sequence_name_with_all_version(info_path)
-            if not self.client.exists(info_path):
+            if not info_path.exists():
                 num_skipped_infos += 1
                 continue
-            infos = self.client.load_pickle(info_path)
-            waymo_infos.extend(infos)
+            with open(info_path, 'rb') as f:
+                infos = pickle.load(f)
+                waymo_infos.extend(infos)
+
+            seq_name_to_infos[infos[0]['point_cloud']['lidar_sequence']] = infos
 
         self.infos.extend(waymo_infos[:])
         self.logger.info('Total skipped info %s' % num_skipped_infos)
@@ -136,21 +137,21 @@ class WaymoDataset(DatasetTemplate):
         self.logger.info('Training data has been deleted from shared memory')
 
     def check_sequence_name_with_all_version(self, sequence_file):
-        if not self.client.exists(sequence_file):
+        if not sequence_file.exists():
             found_sequence_file = sequence_file
             for pre_text in ['training', 'validation', 'testing']:
-                if not self.client.exists(sequence_file):
+                if not sequence_file.exists():
                     temp_sequence_file = Path(str(sequence_file).replace('segment', pre_text + '_segment'))
-                    if self.client.exists(temp_sequence_file):
+                    if temp_sequence_file.exists():
                         found_sequence_file = temp_sequence_file
                         break
-            if not self.client.exists(found_sequence_file):
+            if not found_sequence_file.exists():
                 found_sequence_file = Path(str(sequence_file).replace('_with_camera_labels', ''))
-            if self.client.exists(found_sequence_file):
+            if found_sequence_file.exists():
                 sequence_file = found_sequence_file
         return sequence_file
 
-    def get_infos(self, raw_data_path, save_path, num_workers=multiprocessing.cpu_count(), has_label=True, sampled_interval=1):
+    def get_infos(self, raw_data_path, save_path, num_workers=multiprocessing.cpu_count(), has_label=True, sampled_interval=1, update_info_only=False):
         from functools import partial
         from . import waymo_utils
         print('---------------The waymo sample interval is %d, total sequecnes is %d-----------------'
@@ -158,7 +159,7 @@ class WaymoDataset(DatasetTemplate):
 
         process_single_sequence = partial(
             waymo_utils.process_single_sequence,
-            client=self.client, save_path=save_path, sampled_interval=sampled_interval, has_label=has_label
+            save_path=save_path, sampled_interval=sampled_interval, has_label=has_label
         )
         sample_sequence_file_list = [
             self.check_sequence_name_with_all_version(raw_data_path / sequence_file)
@@ -174,7 +175,7 @@ class WaymoDataset(DatasetTemplate):
 
     def get_lidar(self, sequence_name, sample_idx):
         lidar_file = self.data_path / sequence_name / ('%04d.npy' % sample_idx)
-        point_features = self.client.load_npy(lidar_file)  # (N, 7): [x, y, z, intensity, elongation, NLZ_flag]
+        point_features = np.load(lidar_file)  # (N, 7): [x, y, z, intensity, elongation, NLZ_flag]
 
         points_all, NLZ_flag = point_features[:, 0:5], point_features[:, 5]
         if not self.dataset_cfg.get('DISABLE_NLZ_FLAG_ON_POINTS', False):
@@ -420,10 +421,12 @@ class WaymoDataset(DatasetTemplate):
         database_save_path = save_path / ('%s_gt_database_%s_sampled_%d' % (processed_data_tag, split, sampled_interval))
         db_info_save_path = save_path / ('%s_waymo_dbinfos_%s_sampled_%d.pkl' % (processed_data_tag, split, sampled_interval))
         db_data_save_path = save_path / ('%s_gt_database_%s_sampled_%d_global.npy' % (processed_data_tag, split, sampled_interval))
-        # database_save_path.mkdir(parents=True, exist_ok=True)
+        database_save_path.mkdir(parents=True, exist_ok=True)
         all_db_infos = {}
-        infos = self.client.load_pickle(info_path)
-
+        # print(info_path)
+        with open(info_path, 'rb') as f:
+            infos = pickle.load(f)
+        # print(len(infos))
         point_offset_cnt = 0
         stacked_gt_points = []
         for k in range(0, len(infos), sampled_interval):
@@ -471,7 +474,10 @@ class WaymoDataset(DatasetTemplate):
                     continue
 
                 if (used_classes is None) or names[i] in used_classes:
-                    self.client.put(gt_points.tobytes(), filepath)
+                    gt_points = gt_points.astype(np.float32)
+                    assert gt_points.dtype == np.float32
+                    with open(filepath, 'w') as f:
+                        gt_points.tofile(f)
 
                     db_path = str(filepath.relative_to(self.root_path))  # gt_database/xxxxx.bin
                     db_info = {'name': names[i], 'path': db_path, 'sequence_name': sequence_name,
@@ -489,12 +495,12 @@ class WaymoDataset(DatasetTemplate):
                         all_db_infos[names[i]] = [db_info]
         for k, v in all_db_infos.items():
             print('Database %s: %d' % (k, len(v)))
-
-        self.client.dump_pickle(all_db_infos, db_info_save_path)
+        # print(all_db_infos)
+        with open(db_info_save_path, 'wb') as f:
+            pickle.dump(all_db_infos, f)
 
         # it will be used if you choose to use shared memory for gt sampling
         # stacked_gt_points = np.concatenate(stacked_gt_points, axis=0)
-        # self.client.save_npy(stacked_gt_points, db_data_save_path)
 
 
 def create_waymo_infos(dataset_cfg, class_names, data_path, save_path,
@@ -519,7 +525,8 @@ def create_waymo_infos(dataset_cfg, class_names, data_path, save_path,
         save_path=save_path / processed_data_tag, num_workers=workers, has_label=True,
         sampled_interval=1
     )
-    dataset.client.dump_pickle(waymo_infos_train, train_filename)
+    with open(train_filename, 'wb') as f:
+        pickle.dump(waymo_infos_train, f)
     print('----------------Waymo info train file is saved to %s----------------' % train_filename)
 
     dataset.set_split(val_split)
@@ -528,7 +535,8 @@ def create_waymo_infos(dataset_cfg, class_names, data_path, save_path,
         save_path=save_path / processed_data_tag, num_workers=workers, has_label=True,
         sampled_interval=1
     )
-    dataset.client.dump_pickle(waymo_infos_val, val_filename)
+    with open(val_filename, 'wb') as f:
+        pickle.dump(waymo_infos_val, f)
     print('----------------Waymo info val file is saved to %s----------------' % val_filename)
     
     dataset.set_split(test_split)
@@ -537,12 +545,15 @@ def create_waymo_infos(dataset_cfg, class_names, data_path, save_path,
         save_path=save_path / processed_data_tag, num_workers=workers, has_label=False,
         sampled_interval=1
     )
-    dataset.client.dump_pickle(waymo_infos_test, test_filename)
+    with open(test_filename, 'wb') as f:
+        pickle.dump(waymo_infos_test, f)
+
     print('----------------Waymo info test file is saved to %s----------------' % test_filename)
 
     print('---------------Start create groundtruth database for data augmentation---------------')
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     dataset.set_split(train_split)
+    # print(save_path)
     dataset.create_groundtruth_database(
         info_path=train_filename, save_path=save_path, split='train', sampled_interval=1,
         used_classes=['Vehicle', 'Pedestrian', 'Cyclist'], processed_data_tag=processed_data_tag

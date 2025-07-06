@@ -5,7 +5,7 @@ from typing import Any, Generator, Iterator, Optional, Tuple, Union
 from pathlib import Path
 import pdb
 import os
-import tensorflow as tf
+# import tensorflow as tf
 from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
 import tempfile

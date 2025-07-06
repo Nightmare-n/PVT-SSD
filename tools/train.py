@@ -17,6 +17,9 @@ from pcdet.utils import common_utils
 from train_utils.optimization import build_optimizer, build_scheduler
 from train_utils.train_utils import train_model
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+def log_mem(stage):
+    print(f"[{stage}] allocated: {torch.cuda.memory_allocated()/2**30:.2f} GiB, "
+          f"reserved: {torch.cuda.memory_reserved()/2**30:.2f} GiB")
 
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
@@ -34,7 +37,7 @@ def parse_config():
     parser.add_argument('--fix_random_seed', action='store_true', default=False, help='')
     parser.add_argument('--ckpt_save_interval', type=int, default=1, help='number of training epochs')
     parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
-    parser.add_argument('--max_ckpt_save_num', type=int, default=30, help='max number of saved checkpoint')
+    parser.add_argument('--max_ckpt_save_num', type=int, default=80, help='max number of saved checkpoint')
     parser.add_argument('--merge_all_iters_to_one_epoch', action='store_true', default=False, help='')
     parser.add_argument('--set', dest='set_cfgs', default=None, nargs=argparse.REMAINDER,
                         help='set extra config keys if needed')
@@ -59,10 +62,13 @@ def parse_config():
 
 
 def main():
+    torch.cuda.reset_peak_memory_stats()
+    # log_mem("start")
     args, cfg = parse_config()
     if args.launcher == 'none':
         dist_train = False
         total_gpus = 1
+        cfg.LOCAL_RANK = 0
     else:
         total_gpus, cfg.LOCAL_RANK = getattr(common_utils, 'init_dist_%s' % args.launcher)(
             args.tcp_port, args.local_rank, backend='nccl'
@@ -98,6 +104,7 @@ def main():
     for key, val in vars(args).items():
         logger.info('{:16} {}'.format(key, val))
     log_config_to_file(cfg, logger=logger)
+    
     if cfg.LOCAL_RANK == 0:
         os.system('cp %s %s' % (args.cfg_file, output_dir))
 
@@ -114,14 +121,16 @@ def main():
         merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
         total_epochs=args.epochs
     )
-
+    from pcdet.config import cfg
+    print("DENSE_HEAD config:")
+    print(cfg.MODEL.DENSE_HEAD)
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=train_set, logger=logger)
     if args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
 
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
-
+    # log_mem("after model+opt init")
     # load checkpoint if it is possible
     start_epoch = it = 0
     last_epoch = -1
@@ -161,7 +170,7 @@ def main():
         lr_scheduler=lr_scheduler,
         optim_cfg=cfg.OPTIMIZATION,
         start_epoch=start_epoch,
-        total_epochs=args.epochs,
+        total_epochs=cfg.OPTIMIZATION.NUM_EPOCHS,
         start_iter=it,
         rank=cfg.LOCAL_RANK,
         tb_log=tb_log,

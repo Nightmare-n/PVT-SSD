@@ -171,8 +171,24 @@ class VoxelSetAbstraction(nn.Module):
             )
             point_features_list.append(pooled_features.view(batch_size, num_keypoints, -1))
 
+        from spconv.pytorch import SparseConvTensor
         for k, src_name in enumerate(self.SA_layer_names):
-            cur_coords = batch_dict['multi_scale_3d_features'][src_name].indices
+
+            cur_tensor = batch_dict['multi_scale_3d_features'][src_name]
+            
+            sorted_idx = torch.argsort(cur_tensor.indices[:, 0])
+            
+            new_indices = cur_tensor.indices[sorted_idx]
+            new_features = cur_tensor.features[sorted_idx]
+            new = SparseConvTensor(
+                new_features,
+                new_indices,
+                cur_tensor.spatial_shape,   # same spatial dims
+                cur_tensor.batch_size       # same batch size
+            )
+            batch_dict['multi_scale_3d_features'][src_name] = new
+            cur_coords = new.indices
+            
             xyz = common_utils.get_voxel_centers(
                 cur_coords[:, 1:4],
                 downsample_times=self.downsample_times_map[src_name],

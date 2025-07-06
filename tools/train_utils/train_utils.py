@@ -7,14 +7,21 @@ import time
 from torch.nn.utils import clip_grad_norm_
 from pcdet.utils import common_utils, commu_utils
 
+def log_mem(stage):
+    props = torch.cuda.get_device_properties(0)
+    print(f"Total GPU memory: {props.total_memory/2**30:.2f} GiB")
+    print(f"[{stage}] allocated: {torch.cuda.memory_allocated()/2**30:.2f} GiB, "
+          f"reserved: {torch.cuda.memory_reserved()/2**30:.2f} GiB")
+    print(torch.cuda.memory_summary(device=0, abbreviated=False))
+
 
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
                     rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False, use_amp=False):
     if total_it_each_epoch == len(train_loader):
         dataloader_iter = iter(train_loader)
 
+    # log_mem("before backward")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp, init_scale=optim_cfg.get('LOSS_SCALE_FP16', 2.0**16))
-
     if rank == 0:
         pbar = tqdm.tqdm(total=total_it_each_epoch, leave=leave_pbar, desc='train', dynamic_ncols=True)
         data_time = common_utils.AverageMeter()
@@ -30,6 +37,11 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             batch = next(dataloader_iter)
             print('new iters')
         
+        # move to GPU asynchronously
+        # for k, v in batch.items():
+        #     if isinstance(v, torch.Tensor):
+        #         batch[k] = v.cuda(non_blocking=True)
+
         data_timer = time.time()
         cur_data_time = data_timer - end
 
@@ -45,8 +57,10 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
 
         optimizer.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast(enabled=use_amp,device_type='cuda'):
             loss, tb_dict, disp_dict = model_func(model, batch, global_step=accumulated_iter)
+        
+        # log_mem("after forward")
 
         forward_timer = time.time()
         cur_forward_time = forward_timer - data_timer
@@ -56,7 +70,8 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
         scaler.step(optimizer)
         scaler.update()
-
+        # log_mem("after backward")
+        
         accumulated_iter += 1
 
         cur_batch_time = time.time() - end
@@ -94,9 +109,10 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 start_epoch, total_epochs, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
                 merge_all_iters_to_one_epoch=False, use_amp=False):
-    accumulated_iter = start_iter
-    with tqdm.trange(start_epoch, total_epochs, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:
+    accumulated_iter = 0
+    with tqdm.trange(0, total_epochs, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:
         total_it_each_epoch = len(train_loader)
+        
         if merge_all_iters_to_one_epoch:
             train_loader.dataset.merge_all_iters_to_one_epoch(merge=True, epochs=total_epochs)
             total_it_each_epoch = len(train_loader) // max(total_epochs, 1)
@@ -125,6 +141,7 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 dataloader_iter=dataloader_iter,
                 use_amp=use_amp
             )
+            
 
             # save trained model
             trained_epoch = cur_epoch + 1

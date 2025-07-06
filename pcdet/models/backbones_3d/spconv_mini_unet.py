@@ -36,6 +36,24 @@ class SparseMiddleLayer(spconv.SparseModule):
         self.conv_out = block(256, 128, 3, norm_fn=norm_fn, indice_key='_subm1', dim=2)
 
     def forward(self, x):
+        from spconv.pytorch import SparseConvTensor
+        # 1) grab the old tensor
+        old = x  
+
+        # 2) compute your sort order
+        sorted_idx = torch.argsort(old.indices[:, 0])
+
+        # 3) slice out the sorted pieces
+        new_indices  = old.indices[sorted_idx]
+        new_features = old.features[sorted_idx]
+
+        # 4) re-instantiate a new SparseConvTensor
+        x = SparseConvTensor(
+            new_features,
+            new_indices,
+            old.spatial_shape,    # same spatial dims
+            old.batch_size,       # same batch size
+        )
         x_in = x.dense()
         N, _, _, Y, X = x_in.shape
         x_in = spconv.SparseConvTensor.from_dense(x_in.view(N, -1, Y, X).permute(0, 2, 3, 1).contiguous())

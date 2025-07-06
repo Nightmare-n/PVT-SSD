@@ -207,9 +207,13 @@ def convert_range_image_to_point_cloud(frame, range_images, camera_projections, 
     return points, cp_points, points_NLZ, points_intensity, points_elongation, top_inclination, top_extrinsic
 
 
-def save_lidar_points(frame, cur_save_path, client, use_two_returns=True):
-    range_images, camera_projections, range_image_top_pose = \
-        frame_utils.parse_range_image_and_camera_projection(frame)
+def save_lidar_points(frame, cur_save_path, use_two_returns=True):
+    ret_outputs = frame_utils.parse_range_image_and_camera_projection(frame)
+    if len(ret_outputs) == 4:
+        range_images, camera_projections, seg_labels, range_image_top_pose = ret_outputs
+    else:
+        assert len(ret_outputs) == 3
+        range_images, camera_projections, range_image_top_pose = ret_outputs
 
     points, cp_points, points_in_NLZ_flag, points_intensity, points_elongation, inclination, extrinsic = convert_range_image_to_point_cloud(
         frame, range_images, camera_projections, range_image_top_pose, ri_index=(0, 1) if use_two_returns else (0,)
@@ -226,7 +230,7 @@ def save_lidar_points(frame, cur_save_path, client, use_two_returns=True):
         points_all, points_intensity, points_elongation, points_in_NLZ_flag
     ], axis=-1).astype(np.float32)
 
-    client.save_npy(save_points, cur_save_path, update_cache=True)
+    np.save(cur_save_path, save_points)
 
     return num_points_of_each_lidar, inclination, extrinsic
 
@@ -270,22 +274,22 @@ def generate_labels_2d(frame, camera_names):
     return annotations
 
 
-def process_single_sequence(sequence_file, save_path, sampled_interval, client, has_label=True, use_two_returns=True):
+def process_single_sequence(sequence_file, save_path, sampled_interval, has_label=True, use_two_returns=True):
     sequence_name = os.path.splitext(os.path.basename(sequence_file))[0]
 
     # print('Load record (sampled_interval=%d): %s' % (sampled_interval, sequence_name))
-    if not client.exists(sequence_file):
+    if not sequence_file.exists():
         print('NotFoundError: %s' % sequence_file)
         return []
 
-    dataset = tf.data.TFRecordDataset(client._map_path(sequence_file), compression_type='')
+    dataset = tf.data.TFRecordDataset(str(sequence_file), compression_type='')
     cur_save_dir = save_path / sequence_name
-    # cur_save_dir.mkdir(parents=True, exist_ok=True)
+    cur_save_dir.mkdir(parents=True, exist_ok=True)
     pkl_file = cur_save_dir / ('%s.pkl' % sequence_name)
 
     sequence_infos = []
-    if client.exists(pkl_file):
-        sequence_infos = client.load_pickle(pkl_file, update_cache=True)
+    if pkl_file.exists():
+        sequence_infos = pickle.load(open(pkl_file, 'rb'))
         print('Skip sequence since it has been processed before: %s' % pkl_file)
         return sequence_infos
 
@@ -294,7 +298,7 @@ def process_single_sequence(sequence_file, save_path, sampled_interval, client, 
             continue
         # print(sequence_name, cnt)
         frame = dataset_pb2.Frame()
-        frame.ParseFromString(bytearray(data.numpy()))
+        frame.ParseFromString(data.numpy())
 
         info = {}
         pc_info = {'lidar_sequence': sequence_name, 'sample_idx': cnt}
@@ -314,14 +318,21 @@ def process_single_sequence(sequence_file, save_path, sampled_interval, client, 
             info['annos'] = annotations
 
         num_points_of_each_lidar, inclination, extrinsic = save_lidar_points(
-            frame, cur_save_dir / ('%04d.npy' % cnt), client, use_two_returns=use_two_returns
+            frame, cur_save_dir / ('%04d.npy' % cnt), use_two_returns=use_two_returns
         )
         info['inclination'] = inclination
         info['extrinsic'] = extrinsic
 
         sequence_infos.append(info)
 
-    client.dump_pickle(sequence_infos, pkl_file, update_cache=True)
+    with open(pkl_file, 'wb') as f:
+        pickle.dump(sequence_infos, f)
+
+    try:
+        os.remove(sequence_file)
+        print(f"Deleted raw TFRecord: {sequence_file}")
+    except Exception as e:
+        print(f"Warning: could not delete {sequence_file}: {e}")
 
     print('Infos are saved to (sampled_interval=%d): %s' % (sampled_interval, pkl_file))
     return sequence_infos

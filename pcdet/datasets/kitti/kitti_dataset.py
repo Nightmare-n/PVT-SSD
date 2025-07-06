@@ -6,7 +6,7 @@ from . import kitti_utils
 from ...ops.roiaware_pool3d import roiaware_pool3d_utils
 from ...utils import box_utils, calibration_kitti, common_utils, object3d_kitti, file_client
 from ..dataset import DatasetTemplate
-
+from skimage import io
 
 class KittiDataset(DatasetTemplate):
     def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None):
@@ -26,8 +26,7 @@ class KittiDataset(DatasetTemplate):
         self.root_split_path = self.root_path / ('training' if self.split != 'test' else 'testing')
 
         split_dir = self.root_path / 'ImageSets' / (self.split + '.txt')
-        with self.client.get_local_path(split_dir) as path:
-            self.sample_id_list = [x.strip() for x in open(path).readlines()]
+        self.sample_id_list = [x.strip() for x in open(split_dir).readlines()] if split_dir.exists() else None
 
         self.kitti_infos = []
         self.include_kitti_data(self.mode)
@@ -39,10 +38,11 @@ class KittiDataset(DatasetTemplate):
 
         for info_path in self.dataset_cfg.INFO_PATH[mode]:
             info_path = self.root_path / info_path
-            if not self.client.exists(info_path):
+            if not info_path.exists():
                 continue
-            infos = self.client.load_pickle(info_path)
-            kitti_infos.extend(infos)
+            with open(info_path, 'rb') as f:
+                infos = pickle.load(f)
+                kitti_infos.extend(infos)
 
         self.kitti_infos.extend(kitti_infos)
 
@@ -57,39 +57,50 @@ class KittiDataset(DatasetTemplate):
         self.root_split_path = self.root_path / ('training' if self.split != 'test' else 'testing')
 
         split_dir = self.root_path / 'ImageSets' / (self.split + '.txt')
-        with self.client.get_local_path(split_dir) as path:
-            self.sample_id_list = [x.strip() for x in open(path).readlines()]
+        self.sample_id_list = [x.strip() for x in open(split_dir).readlines()] if split_dir.exists() else None
 
     def get_lidar(self, idx):
-        lidar_file = self.root_split_path / 'velodyne_reduced' / ('%s.bin' % idx)
-        return self.client.load_to_numpy(str(lidar_file), dtype=np.float32).reshape(-1, 4)
+        lidar_file = self.root_split_path / 'velodyne' / ('%s.bin' % idx)
+        assert lidar_file.exists()
+        return np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, 4)
 
     def get_image(self, idx):
+        """
+        Loads image for a sample
+        Args:
+            idx: int, Sample index
+        Returns:
+            image: (H, W, 3), RGB Image
+        """
         img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
-        assert self.client.exists(img_file)
-        return self.client.load_img(str(img_file)).astype(np.float32)  # BGR, uint8
+        assert img_file.exists()
+        image = io.imread(img_file)
+        image = image.astype(np.float32)
+        image /= 255.0
+        return image
 
     def get_image_shape(self, idx):
         img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
-        assert self.client.exists(img_file)
-        return np.array(self.client.load_img(str(img_file)).shape[:2], dtype=np.int32)
+        assert img_file.exists()
+        return np.array(io.imread(img_file).shape[:2], dtype=np.int32)
 
     def get_label(self, idx):
         label_file = self.root_split_path / 'label_2' / ('%s.txt' % idx)
-        assert self.client.exists(label_file)
-        return object3d_kitti.get_objects_from_label(label_file, self.client)
+        assert label_file.exists()
+        return object3d_kitti.get_objects_from_label(label_file)
 
     def get_calib(self, idx):
         calib_file = self.root_split_path / 'calib' / ('%s.txt' % idx)
-        assert self.client.exists(calib_file)
-        return calibration_kitti.Calibration(calib_file, self.client)
+        assert calib_file.exists()
+        return calibration_kitti.Calibration(calib_file)
 
     def get_road_plane(self, idx):
         plane_file = self.root_split_path / 'planes' / ('%s.txt' % idx)
-        assert self.client.exists(plane_file)
+        if not plane_file.exists():
+            return None
 
-        with self.client.get_local_path(plane_file) as path:
-            lines = open(path).readlines()
+        with open(plane_file, 'r') as f:
+            lines = f.readlines()
         lines = [float(i) for i in lines[3].split()]
         plane = np.asarray(lines)
 
@@ -200,9 +211,11 @@ class KittiDataset(DatasetTemplate):
         database_save_path = Path(self.root_path) / ('gt_database' if split == 'train' else ('gt_database_%s' % split))
         db_info_save_path = Path(self.root_path) / ('kitti_dbinfos_%s.pkl' % split)
 
+        database_save_path.mkdir(parents=True, exist_ok=True)
         all_db_infos = {}
 
-        infos = self.client.load_pickle(info_path)
+        with open(info_path, 'rb') as f:
+            infos = pickle.load(f)
 
         for k in range(len(infos)):
             print('gt_database sample: %d/%d' % (k + 1, len(infos)))
@@ -227,7 +240,8 @@ class KittiDataset(DatasetTemplate):
 
                 gt_points[:, :3] -= gt_boxes[i, :3]
 
-                self.client.put(gt_points.tobytes(), filepath)
+                with open(filepath, 'w') as f:
+                    gt_points.tofile(f)
 
                 if (used_classes is None) or names[i] in used_classes:
                     db_path = str(filepath.relative_to(self.root_path))  # gt_database/xxxxx.bin
@@ -241,7 +255,8 @@ class KittiDataset(DatasetTemplate):
         for k, v in all_db_infos.items():
             print('Database %s: %d' % (k, len(v)))
 
-        self.client.dump_pickle(all_db_infos, db_info_save_path)
+        with open(db_info_save_path, 'wb') as f:
+            pickle.dump(all_db_infos, f)
 
     @staticmethod
     def generate_prediction_dicts(batch_dict, pred_dicts, class_names, output_path=None):
@@ -409,20 +424,24 @@ def create_kitti_infos(dataset_cfg, class_names, data_path, save_path, workers=4
 
     dataset.set_split(train_split)
     kitti_infos_train = dataset.get_infos(num_workers=workers, has_label=True, count_inside_pts=True)
-    dataset.client.dump_pickle(kitti_infos_train, train_filename)
+    with open(train_filename, 'wb') as f:
+        pickle.dump(kitti_infos_train, f)
     print('Kitti info train file is saved to %s' % train_filename)
 
     dataset.set_split(val_split)
     kitti_infos_val = dataset.get_infos(num_workers=workers, has_label=True, count_inside_pts=True)
-    dataset.client.dump_pickle(kitti_infos_val, val_filename)
+    with open(val_filename, 'wb') as f:
+        pickle.dump(kitti_infos_val, f)
     print('Kitti info val file is saved to %s' % val_filename)
 
-    dataset.client.dump_pickle(kitti_infos_train + kitti_infos_val, trainval_filename)
+    with open(trainval_filename, 'wb') as f:
+        pickle.dump(kitti_infos_train + kitti_infos_val, f)
     print('Kitti info trainval file is saved to %s' % trainval_filename)
 
     dataset.set_split('test')
     kitti_infos_test = dataset.get_infos(num_workers=workers, has_label=False, count_inside_pts=False)
-    dataset.client.dump_pickle(kitti_infos_test, test_filename)
+    with open(test_filename, 'wb') as f:
+        pickle.dump(kitti_infos_test, f)
     print('Kitti info test file is saved to %s' % test_filename)
 
     print('---------------Start create groundtruth database for data augmentation---------------')

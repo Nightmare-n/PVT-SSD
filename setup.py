@@ -3,7 +3,9 @@ import subprocess
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
+import distutils.log, logging
+distutils.log.set_verbosity(2)      # 0 = quiet, 1 = normal, 2 = verbose
+logging.basicConfig(level=logging.DEBUG)
 
 def get_git_commit_number():
     if not os.path.exists('.git'):
@@ -56,8 +58,15 @@ if __name__ == '__main__':
         author_email='shaoshuaics@gmail.com',
         license='Apache License 2.0',
         packages=find_packages(exclude=['tools', 'data', 'output']),
+        # cmdclass={
+        #     'build_ext': BuildExtension,
+        # },
         cmdclass={
-            'build_ext': BuildExtension,
+            'build_ext': BuildExtension.with_options(
+            parallel=os.cpu_count(),  # spawn one job per core
+            verbose=True,             # print each compile command
+            use_ninja=True,
+            ),
         },
         ext_modules=[
             make_cuda_ext(

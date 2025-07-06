@@ -7,24 +7,15 @@ DATA_CONFIG:
       DISABLE_AUG_LIST: ['placeholder']
       AUG_CONFIG_LIST:
         - NAME: gt_sampling
-          BACKEND:
-              NAME: HardDiskBackend
-              KWARGS: {
-                # 'path_mapping': {
-                #   '/mnt/petrelfs/yanghonghui': 's3://yanghonghui',
-                #   '/workspace/data': 's3://yanghonghui'
-                # },
-                # 'enable_mc': False
-              }
           USE_ROAD_PLANE: True
           DB_INFO_PATH:
               - kitti_dbinfos_train.pkl
           PREPARE: {
-              filter_by_min_points: ['Car:5', 'Pedestrian:5', 'Cyclist:5'],
+              filter_by_min_points: ['Car:5'],
               filter_by_difficulty: [-1],
           }
 
-          SAMPLE_GROUPS: ['Car:15','Pedestrian:10', 'Cyclist:10']
+          SAMPLE_GROUPS: ['Car:15']
           NUM_POINT_FEATURES: 4
           DATABASE_WITH_FAKELIDAR: False
           REMOVE_EXTRA_WIDTH: [0.0, 0.0, 0.0]
@@ -194,7 +185,7 @@ MODEL:
 
 
 OPTIMIZATION:
-    BATCH_SIZE_PER_GPU: 4
+    BATCH_SIZE_PER_GPU: 14
     NUM_EPOCHS: 80
 
     OPTIMIZER: adam_onecycle

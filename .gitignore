@@ -1,5 +1,6 @@
 **__pycache__**
 **build**
+data/
 **egg-info**
 *.pyc
 venv/
@@ -9,6 +10,7 @@ venv/
 *.pkl
 *.zip
 *.bin
-output
 version.py
+pvt/
+output/
 .vscode

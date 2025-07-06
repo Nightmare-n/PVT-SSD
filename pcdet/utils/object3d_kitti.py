@@ -1,9 +1,9 @@
 import numpy as np
 
 
-def get_objects_from_label(label_file, client):
-    with client.get_local_path(label_file) as path:
-        lines = open(path).readlines()
+def get_objects_from_label(label_file):
+    with open(label_file, 'r') as f:
+        lines = f.readlines()
     objects = [Object3d(line) for line in lines]
     return objects
 

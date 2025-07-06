@@ -1,9 +1,9 @@
 import numpy as np
 
 
-def get_calib_from_file(calib_file, client):
-    with client.get_local_path(calib_file) as path:
-        lines = open(path).readlines()
+def get_calib_from_file(calib_file):
+    with open(calib_file) as f:
+        lines = f.readlines()
 
     obj = lines[2].strip().split(' ')[1:]
     P2 = np.array(obj, dtype=np.float32)
@@ -21,9 +21,9 @@ def get_calib_from_file(calib_file, client):
 
 
 class Calibration(object):
-    def __init__(self, calib_file, client):
+    def __init__(self, calib_file):
         if not isinstance(calib_file, dict):
-            calib = get_calib_from_file(calib_file, client)
+            calib = get_calib_from_file(calib_file)
         else:
             calib = calib_file
 

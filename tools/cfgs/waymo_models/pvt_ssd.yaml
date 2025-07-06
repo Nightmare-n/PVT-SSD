@@ -9,7 +9,7 @@ DATA_CONFIG:
     }
 
     SAMPLED_INTERVAL: {
-        'train': 1,
+        'train': 10,
         'test': 1
     }
 
@@ -17,19 +17,10 @@ DATA_CONFIG:
         DISABLE_AUG_LIST: ['placeholder']
         AUG_CONFIG_LIST:
           - NAME: gt_sampling
-            
-            BACKEND:
-              NAME: HardDiskBackend
-              KWARGS: {
-                # 'path_mapping': {
-                #   '/mnt/petrelfs/yanghonghui': 's3://yanghonghui'
-                # },
-                # 'enable_mc': True
-              }
 
             USE_ROAD_PLANE: False
             DB_INFO_PATH:
-                - waymo_processed_data_waymo_dbinfos_train_sampled_1.pkl
+              - waymo_processed_data_waymo_dbinfos_train_sampled_1.pkl
 
             USE_SHARED_MEMORY: False  # set it to True to speed up (it costs about 15GB shared memory)
             DB_DATA_PATH:
@@ -217,7 +208,7 @@ MODEL:
 
 
 OPTIMIZATION:
-    BATCH_SIZE_PER_GPU: 8
+    BATCH_SIZE_PER_GPU: 10
     NUM_EPOCHS: 30
 
     OPTIMIZER: adam_onecycle
